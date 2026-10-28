@@ -9,956 +9,880 @@ getfenv().PP_SCRAMBLE_NUM = function(...) return ... end
 getfenv().PP_SCRAMBLE_STR = function(...) return ... end
 getfenv().PP_SCRAMBLE_RE_NUM = function(...) return ... end
 
-local StreetLife = {
+local Potent = {
 	connections = {},
-	espObjects = {},
-	running = true,
-	library = nil,
-	fovCircle = nil,
-	fpsLabel = nil,
-	godConnection = nil,
-	savedWalkSpeed = nil,
-	savedJumpPower = nil,
-	savedFieldOfView = nil,
-	shooting = false,
-	lastPitch = nil,
-	lastAmmoScan = 0,
-	fpsFrames = 0,
-	fpsTimestamp = os.clock(),
-	currentFps = 0,
+	esp = {},
+	circles = {},
+	velocities = {},
+	lockedPlayer = nil,
+	silentInstalled = false,
+	unloaded = false,
 }
 
 -- Constants.
 local REPO = "https://raw.githubusercontent.com/violin-suzutsuki/LinoriaLib/main/"
-local MENU_TITLE = "Street Life Remastered"
-local TELEPORTS_FOLDER_NAME = "Teleports"
-local LANDMARK_FOLDERS = { "Bank", "Jewel", "Museum", "YachtRobbery", "Oilrig", "Gym", "Arcade", "PDStation", "Halloween" }
-local AIM_TARGET_PARTS = { "Head", "Torso", "HumanoidRootPart" }
-local AIM_JITTER_PX = 0.6
-local TORSO_NAMES = { "UpperTorso", "Torso" }
-local AMMO_KEYWORDS = { "ammo", "clip", "mag" }
-local STAMINA_KEYWORDS = { "stamina", "energy", "sprint", "endurance", "dash", "fatigue" }
-local INF_AMMO_VALUE = 999
-local AMMO_SCAN_INTERVAL = 0.25
-local STAMINA_INTERVAL = 0.5
-local STAMINA_REFILL_THRESHOLD = 90
-local STAMINA_MAX = 100
-local STAMINA_ATTRIBUTE_FLOOR = 95
-local DEFAULT_MAX_HEALTH = 100
-local RECOIL_DIRECTION = 1
-local RECOIL_PITCH_THRESHOLD = 0.0008
-local RECOIL_COMPENSATION = 0.85
-local ESP_BOX_RATIO = 1.5
-local ESP_HEAD_OFFSET = Vector3.new(0, 2.5, 0)
-local ESP_FEET_OFFSET = Vector3.new(0, 3, 0)
-local TELEPORT_HEIGHT_OFFSET = Vector3.new(0, 5, 0)
-local CAR_GROUND_MIN_SPEED = 5
-local SKELETON_LINKS = {
-	{ { "Head" }, TORSO_NAMES },
-	{ TORSO_NAMES, { "LeftUpperArm", "Left Arm" } },
-	{ TORSO_NAMES, { "RightUpperArm", "Right Arm" } },
-	{ TORSO_NAMES, { "LeftUpperLeg", "Left Leg" } },
-	{ TORSO_NAMES, { "RightUpperLeg", "Right Leg" } },
-}
-local CAR_TELEPORTS = {
-	{ name = "Jewelry", position = Vector3.new(1, 52, -186) },
-	{ name = "Yacht", position = Vector3.new(927, 81, -1824) },
-	{ name = "Bank", position = Vector3.new(395, 52, 59) },
-	{ name = "Museum", position = Vector3.new(1322, 52, -117) },
-	{ name = "Mansion", position = Vector3.new(1367, 55, 221) },
-	{ name = "Gas Station", position = Vector3.new(309, 52, 179) },
-	{ name = "Gunstore 1", position = Vector3.new(604, 52, -368) },
-	{ name = "Gunstore 2", position = Vector3.new(35, 70, 551) },
-	{ name = "Dealer", position = Vector3.new(242, 52, 309) },
-	{ name = "Gun Buyer", position = Vector3.new(1002, 52, -106) },
-}
+local MENU_TITLE = "Potent | Tribes 3v3"
+local CONFIG_FOLDER = "Potent"
+local RENDER_STEP_NAME = "PotentRender"
+local IGNORED_FOLDERS = { "Projectiles", "FX" }
+local DEFAULT_PROJECTILE_SPEED = 250
+local PREDICTION_ITERATIONS = 4
+local VELOCITY_SMOOTHING = 0.35
+local MAX_TRACKED_SPEED = 150
+local TRIGGER_COOLDOWN = 0.2
+local ESP_FONT = 2
+local BOX_ASPECT = 0.55
 
 -- Services.
-local playersService = game:GetService("Players")
-local runService = game:GetService("RunService")
-local userInputService = game:GetService("UserInputService")
-local httpService = game:GetService("HttpService")
-local teleportService = game:GetService("TeleportService")
+local playersService = cloneref(game:GetService("Players"))
+local runService = cloneref(game:GetService("RunService"))
+local userInputService = cloneref(game:GetService("UserInputService"))
+local replicatedStorage = cloneref(game:GetService("ReplicatedStorage"))
+local lightingService = cloneref(game:GetService("Lighting"))
+local virtualUser = cloneref(game:GetService("VirtualUser"))
 
 -- State.
 local localPlayer = playersService.LocalPlayer
+local Library, Toggles, Options
+local weaponsModule
+local lightingCache
+local triggerHoldUntil
+local triggerReadyAt = 0
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+rayParams.IgnoreWater = true
 
----Fetch and execute a remote Lua source through the executor request function.
+---Fetch a remote source through the executor request function.
+---@param url string
+---@return string
+local function fetchSource(url)
+	local response = request({ Url = url, Method = "GET" })
+	assert(response and response.StatusCode == 200, "Request failed: " .. url)
+	return response.Body
+end
+
+---Load and run a module from the Linoria repository.
 ---@param path string
 ---@return any
-local function fetch(path)
-	local response = request({ Url = REPO .. path, Method = "GET" })
-	assert(response and response.Success, "Failed to fetch " .. path)
-	return loadstring(response.Body)()
+local function loadRemote(path)
+	return loadstring(fetchSource(REPO .. path))()
 end
 
----Track a connection so it can be disconnected on detach.
----@param connection RBXScriptConnection
----@return RBXScriptConnection
-local function track(connection)
-	table.insert(StreetLife.connections, connection)
-	return connection
-end
-
----Show a notification through the menu library.
----@param text string
-local function notify(text)
-	if StreetLife.library then
-		StreetLife.library:Notify(text, 3)
-	end
-end
-
----Check whether a name contains any of the given keywords.
+---Wrap a callback so a runtime error warns once instead of spamming every frame.
 ---@param name string
----@param keywords table
----@return boolean
-local function matchesKeyword(name, keywords)
-	local lowered = string.lower(name)
-	for _, keyword in ipairs(keywords) do
-		if string.find(lowered, keyword, 1, true) then
-			return true
+---@param callback function
+---@return function
+local function guarded(name, callback)
+	local warned = false
+	return function(...)
+		local success, result = pcall(callback, ...)
+		if success or warned then
+			return
 		end
+		warned = true
+		warn(string.format("[Potent] %s: %s", name, tostring(result)))
 	end
-
-	return false
 end
 
----Find the first existing child of a character from a list of names.
----@param character Model
----@param names table
+---Create a Drawing object and apply properties.
+---@param class string
+---@param properties table
+---@return table
+local function newDrawing(class, properties)
+	local drawing = Drawing.new(class)
+	for key, value in pairs(properties) do
+		drawing[key] = value
+	end
+	drawing.Visible = false
+	return drawing
+end
+
+---Get a character's humanoid root part.
+---@param player Player
 ---@return BasePart?
-local function findPart(character, names)
-	for _, name in ipairs(names) do
-		local part = character:FindFirstChild(name)
-		if part then
-			return part
-		end
-	end
-
-	return nil
+local function getRoot(player)
+	local character = player.Character
+	return character and character:FindFirstChild("HumanoidRootPart")
 end
 
----Get the local character, humanoid and root part if all are alive.
----@return Model?, Humanoid?, BasePart?
-local function getLocalParts()
-	local character = localPlayer.Character
-	if not character then
-		return nil
-	end
-
-	local humanoid = character:FindFirstChildOfClass("Humanoid")
-	local rootPart = character:FindFirstChild("HumanoidRootPart")
-	if not (humanoid and rootPart and humanoid.Health > 0) then
-		return nil
-	end
-
-	return character, humanoid, rootPart
-end
-
----Get the vehicle seat the local humanoid is sitting in, if any.
----@param humanoid Humanoid
----@return VehicleSeat?
-local function getVehicleSeat(humanoid)
-	local seat = humanoid.SeatPart
-	if seat and seat:IsA("VehicleSeat") then
-		return seat
-	end
-
-	return nil
-end
-
----Resolve a world position for a workspace landmark folder or model.
----@param name string
----@return Vector3?
-local function getLandmarkPosition(name)
-	local landmark = workspace:FindFirstChild(name)
-	if not landmark then
-		return nil
-	end
-
-	if landmark:IsA("Model") then
-		return landmark:GetPivot().Position
-	end
-
-	for _, descendant in ipairs(landmark:GetDescendants()) do
-		if descendant:IsA("BasePart") then
-			return descendant.Position
-		end
-	end
-
-	return nil
-end
-
----Teleport the local character to a world position.
----@param position Vector3
-local function teleportTo(position)
-	local _, _, rootPart = getLocalParts()
-	if not rootPart then
-		return
-	end
-
-	rootPart.CFrame = CFrame.new(position + TELEPORT_HEIGHT_OFFSET)
-end
-
----Teleport the vehicle the local player is driving to a world position.
----@param position Vector3
-local function teleportCar(position)
-	local _, humanoid = getLocalParts()
-	local seat = humanoid and getVehicleSeat(humanoid)
-	if not seat then
-		return notify("You must be in a vehicle to teleport!")
-	end
-
-	local target = CFrame.new(position + TELEPORT_HEIGHT_OFFSET)
-	local vehicle = seat.Parent
-	if vehicle:IsA("Model") then
-		vehicle:PivotTo(target)
-	else
-		seat.CFrame = target
-	end
-end
-
----Collect the names of every child under a workspace folder.
----@param folderName string
----@return table
-local function collectChildNames(folderName)
-	local names = {}
-	local folder = workspace:FindFirstChild(folderName)
-	if not folder then
-		return names
-	end
-
-	for _, child in ipairs(folder:GetChildren()) do
-		table.insert(names, child.Name)
-	end
-
-	table.sort(names)
-	return names
-end
-
----Collect landmark names that currently exist in the workspace.
----@return table
-local function collectLandmarks()
-	local names = {}
-	for _, name in ipairs(LANDMARK_FOLDERS) do
-		if workspace:FindFirstChild(name) then
-			table.insert(names, name)
-		end
-	end
-
-	return names
-end
-
----Collect the configured car teleport names.
----@return table
-local function collectCarTeleports()
-	local names = {}
-	for _, entry in ipairs(CAR_TELEPORTS) do
-		table.insert(names, entry.name)
-	end
-
-	return names
-end
-
----Look up a car teleport position by name.
----@param name string
----@return Vector3?
-local function getCarTeleportPosition(name)
-	for _, entry in ipairs(CAR_TELEPORTS) do
-		if entry.name == name then
-			return entry.position
-		end
-	end
-
-	return nil
-end
-
----Hop to another public server with free slots.
-local function serverHop()
-	local url = string.format("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Asc&limit=100", game.PlaceId)
-	local success, servers = pcall(function()
-		return httpService:JSONDecode(request({ Url = url, Method = "GET" }).Body)
-	end)
-
-	if not (success and servers and servers.data) then
-		return notify("Server list unavailable.")
-	end
-
-	for _, server in ipairs(servers.data) do
-		if server.playing < server.maxPlayers and server.id ~= game.JobId then
-			return teleportService:TeleportToPlaceInstance(game.PlaceId, server.id, localPlayer)
-		end
-	end
-
-	notify("No free server found.")
-end
-
----Check line of sight from the camera to a target part.
----@param camera Camera
----@param targetPart BasePart
+---Check if the player is alive according to the game and the humanoid.
+---@param player Player
 ---@return boolean
-local function isVisible(camera, targetPart)
-	if not getgenv().Toggles.AimWallCheck.Value then
+local function isAlive(player)
+	if player:GetAttribute("Alive") == false then
+		return false
+	end
+	local character = player.Character
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	return humanoid ~= nil and humanoid.Health > 0
+end
+
+---Check if the player is in the same match as the local player.
+---@param player Player
+---@return boolean
+local function isInMatch(player)
+	local myMatch = localPlayer:GetAttribute("MatchId")
+	if not myMatch or myMatch == "" then
 		return true
 	end
+	return player:GetAttribute("MatchId") == myMatch
+end
 
-	local params = RaycastParams.new()
-	params.FilterType = Enum.RaycastFilterType.Exclude
-	params.FilterDescendantsInstances = { localPlayer.Character }
+---Check if the player is on the local player's team.
+---@param player Player
+---@return boolean
+local function isTeammate(player)
+	local myTeam = localPlayer:GetAttribute("Team")
+	return myTeam ~= nil and myTeam ~= 0 and myTeam == player:GetAttribute("Team")
+end
+
+---Check if the player can be targeted by combat features.
+---@param player Player
+---@return boolean
+local function isTargetable(player)
+	if player == localPlayer or not isAlive(player) or not isInMatch(player) then
+		return false
+	end
+	if Toggles.TeamCheck.Value and isTeammate(player) then
+		return false
+	end
+	return getRoot(player) ~= nil
+end
+
+---Get the currently equipped tool.
+---@return Tool?
+local function getEquippedTool()
+	local character = localPlayer.Character
+	return character and character:FindFirstChildOfClass("Tool")
+end
+
+---Resolve the tuning table of the equipped weapon.
+---@return table?
+local function getWeaponTuning()
+	local tool = getEquippedTool()
+	if not tool or not weaponsModule then
+		return nil
+	end
+
+	local weaponId = tool:GetAttribute("WeaponId") or tool:GetAttribute("Id") or tool.Name
+	local success, weapon = pcall(weaponsModule.Get, weaponId)
+	if success and type(weapon) == "table" then
+		return weapon.tuning
+	end
+
+	-- Fall back to a display name match when the tool is not named after the id.
+	local listed, weapons = pcall(weaponsModule.All)
+	if not listed or type(weapons) ~= "table" then
+		return nil
+	end
+	for _, entry in pairs(weapons) do
+		if type(entry) == "table" and entry.name == tool.Name then
+			return entry.tuning
+		end
+	end
+	return nil
+end
+
+---Get projectile speed and gravity for the equipped weapon.
+---@return number, number
+local function getProjectileStats()
+	local tuning = getWeaponTuning()
+	if not tuning then
+		return DEFAULT_PROJECTILE_SPEED, 0
+	end
+	local speed = tuning.speed or tuning.speedMax or DEFAULT_PROJECTILE_SPEED
+	return math.max(speed, 1), tuning.gravity or 0
+end
+
+---Estimate velocities for every other player from position deltas.
+---@param deltaTime number
+local function trackVelocities(deltaTime)
+	for _, player in ipairs(playersService:GetPlayers()) do
+		if player == localPlayer then
+			continue
+		end
+
+		local root = getRoot(player)
+		if not root then
+			Potent.velocities[player] = nil
+			continue
+		end
+
+		local entry = Potent.velocities[player]
+		if not entry then
+			Potent.velocities[player] = { position = root.Position, velocity = Vector3.zero }
+			continue
+		end
+
+		if deltaTime > 0 then
+			local rawVelocity = (root.Position - entry.position) / deltaTime
+			if rawVelocity.Magnitude > MAX_TRACKED_SPEED then
+				rawVelocity = Vector3.zero
+			end
+			entry.velocity = entry.velocity:Lerp(rawVelocity, VELOCITY_SMOOTHING)
+		end
+		entry.position = root.Position
+	end
+end
+
+---Compute the point to aim at with lead and drop compensation.
+---@param origin Vector3
+---@param player Player
+---@param part BasePart
+---@return Vector3
+local function getAimPosition(origin, player, part)
+	local usePrediction = Toggles.Prediction.Value
+	local useDrop = Toggles.DropCompensation.Value
+	local position = part.Position
+	if not usePrediction and not useDrop then
+		return position
+	end
+
+	local speed, gravity = getProjectileStats()
+	local entry = Potent.velocities[player]
+	local velocity = entry and entry.velocity or Vector3.zero
+	local travelTime = 0
+
+	for _ = 1, PREDICTION_ITERATIONS do
+		travelTime = (position - origin).Magnitude / speed
+		if usePrediction then
+			position = part.Position + velocity * travelTime * Options.PredictionScale.Value
+		end
+	end
+
+	if useDrop then
+		position += Vector3.new(0, 0.5 * gravity * travelTime * travelTime, 0)
+	end
+	return position
+end
+
+---Check line of sight from the camera to a part.
+---@param part BasePart
+---@return boolean
+local function isVisible(part)
+	local camera = workspace.CurrentCamera
+	local ignore = { localPlayer.Character, part.Parent }
+	for _, name in ipairs(IGNORED_FOLDERS) do
+		local folder = workspace:FindFirstChild(name)
+		if folder then
+			table.insert(ignore, folder)
+		end
+	end
+	rayParams.FilterDescendantsInstances = ignore
 
 	local origin = camera.CFrame.Position
-	local result = workspace:Raycast(origin, targetPart.Position - origin, params)
-	return result == nil or result.Instance:IsDescendantOf(targetPart.Parent)
+	return workspace:Raycast(origin, part.Position - origin, rayParams) == nil
 end
 
----Resolve the configured aim target part on a character.
----@param character Model
----@return BasePart?
-local function getAimPart(character)
-	local name = getgenv().Options.AimTargetPart.Value
-	if name == "Torso" then
-		return findPart(character, TORSO_NAMES)
+---Pick the body part name for a target part setting.
+---@param setting string
+---@return string
+local function resolvePartName(setting)
+	if setting == "Random" then
+		return math.random() < 0.5 and "Head" or "UpperTorso"
 	end
-
-	return character:FindFirstChild(name) or character:FindFirstChild("HumanoidRootPart")
+	return setting
 end
 
----Return the aim part whose projection is closest to the cursor within the fov radius.
----@param camera Camera
----@return BasePart?
-local function getClosestTarget(camera)
-	local closest, closestDist = nil, getgenv().Options.AimFovRadius.Value
-	local mousePos = userInputService:GetMouseLocation()
+---Return the player whose chosen part projects closest to the cursor within fovRadius.
+---@param fovRadius number
+---@param partName string
+---@param wallCheck boolean
+---@return Player?, BasePart?, number?
+local function getClosestPlayer(fovRadius, partName, wallCheck)
+	local camera = workspace.CurrentCamera
+	local mousePosition = userInputService:GetMouseLocation()
+	local closest, closestPart, closestDistance = nil, nil, fovRadius
 
 	for _, player in ipairs(playersService:GetPlayers()) do
-		if player == localPlayer then continue end
-		local character = player.Character
-		if not character then continue end
-		local humanoid = character:FindFirstChildOfClass("Humanoid")
-		local part = getAimPart(character)
-		if not (humanoid and part and humanoid.Health > 0) then continue end
-
-		local screenPos, onScreen = camera:WorldToViewportPoint(part.Position)
-		if not onScreen then continue end
-
-		local dist = (Vector2.new(screenPos.X, screenPos.Y) - mousePos).Magnitude
-		if dist < closestDist and isVisible(camera, part) then
-			closest = part
-			closestDist = dist
+		if not isTargetable(player) then
+			continue
 		end
+
+		local part = player.Character:FindFirstChild(partName)
+		if not part then
+			continue
+		end
+
+		local screenPosition, onScreen = camera:WorldToViewportPoint(part.Position)
+		if not onScreen then
+			continue
+		end
+
+		local distance = (Vector2.new(screenPosition.X, screenPosition.Y) - mousePosition).Magnitude
+		if distance >= closestDistance then
+			continue
+		end
+		if wallCheck and not isVisible(part) then
+			continue
+		end
+
+		closest, closestPart, closestDistance = player, part, distance
 	end
 
-	return closest
+	return closest, closestPart, closestDistance
 end
 
----Create the drawing objects for a player's ESP.
+---Update the aimbot for this frame.
+---@param camera Camera
+local function updateAimbot(camera)
+	if not Toggles.AimbotEnabled.Value or not Options.AimbotKey:GetState() then
+		Potent.lockedPlayer = nil
+		return
+	end
+	if userInputService:GetFocusedTextBox() or not isrbxactive() then
+		return
+	end
+
+	local partName = resolvePartName(Options.AimbotPart.Value)
+	local player, part
+	local locked = Potent.lockedPlayer
+	if Toggles.StickyAim.Value and locked and isTargetable(locked) then
+		part = locked.Character:FindFirstChild(partName)
+		player = part and locked
+	end
+	if not player then
+		player, part = getClosestPlayer(Options.AimbotFov.Value, partName, Toggles.AimbotWallCheck.Value)
+	end
+	Potent.lockedPlayer = player
+	if not player then
+		return
+	end
+
+	local aimPosition = getAimPosition(camera.CFrame.Position, player, part)
+	local alpha = math.clamp(1 - Options.AimbotSmoothing.Value / 100, 0.02, 1)
+
+	if Options.AimbotMethod.Value == "Camera" then
+		camera.CFrame = camera.CFrame:Lerp(CFrame.lookAt(camera.CFrame.Position, aimPosition), alpha)
+		return
+	end
+
+	local screenPosition = camera:WorldToViewportPoint(aimPosition)
+	if screenPosition.Z <= 0 then
+		return
+	end
+	local delta = (Vector2.new(screenPosition.X, screenPosition.Y) - userInputService:GetMouseLocation()) * alpha
+	mousemoverel(delta.X, delta.Y)
+end
+
+---Release the trigger if it is currently held.
+local function releaseTrigger()
+	if triggerHoldUntil then
+		mouse1release()
+		triggerHoldUntil = nil
+	end
+end
+
+---Update the triggerbot for this frame.
+local function updateTriggerbot()
+	if not Toggles.TriggerbotEnabled.Value then
+		releaseTrigger()
+		return
+	end
+
+	local now = os.clock()
+	if triggerHoldUntil then
+		if now >= triggerHoldUntil then
+			releaseTrigger()
+			triggerReadyAt = now + TRIGGER_COOLDOWN
+		end
+		return
+	end
+	if now < triggerReadyAt or not isrbxactive() or not getEquippedTool() then
+		return
+	end
+
+	local player = getClosestPlayer(Options.TriggerFov.Value, resolvePartName(Options.TriggerPart.Value), true)
+	if not player then
+		return
+	end
+	mouse1press()
+	triggerHoldUntil = now + Options.TriggerHold.Value
+end
+
+---Compute a silent aim direction for the shot origin.
+---@param origin Vector3
+---@return Vector3?
+local function getSilentDirection(origin)
+	if math.random(1, 100) > Options.SilentHitChance.Value then
+		return nil
+	end
+
+	local partName = resolvePartName(Options.SilentPart.Value)
+	local player, part = getClosestPlayer(Options.SilentFov.Value, partName, Toggles.SilentWallCheck.Value)
+	if not player then
+		return nil
+	end
+
+	local direction = getAimPosition(origin, player, part) - origin
+	if direction.Magnitude < 1 then
+		return nil
+	end
+	return direction.Unit
+end
+
+---Replace the game's aim direction resolver with a silent aim variant.
+local function installSilentAim()
+	if Potent.silentInstalled then
+		return
+	end
+
+	setthreadidentity(2)
+	local success, combatUtil = pcall(require, localPlayer.PlayerScripts.Combat.Util)
+	setthreadidentity(8)
+	if not success or type(combatUtil) ~= "table" or type(combatUtil.AimDirection) ~= "function" then
+		Library:Notify("Silent aim: Combat.Util not found.", 6)
+		return
+	end
+
+	local original = combatUtil.AimDirection
+	local replacement = newcclosure(function(origin)
+		local direction = getSilentDirection(origin)
+		if direction then
+			return direction
+		end
+		return original(origin)
+	end)
+	pcall(setstackhidden, replacement, true)
+
+	combatUtil.AimDirection = replacement
+	Potent.silentUtil = combatUtil
+	Potent.silentOriginal = original
+	Potent.silentInstalled = true
+end
+
+---Restore the game's original aim direction resolver.
+local function removeSilentAim()
+	if not Potent.silentInstalled then
+		return
+	end
+	Potent.silentUtil.AimDirection = Potent.silentOriginal
+	Potent.silentInstalled = false
+end
+
+---Create the drawing and highlight objects for a player.
 ---@param player Player
+---@return table
 local function createEsp(player)
-	if player == localPlayer or StreetLife.espObjects[player] then
-		return
-	end
+	local highlight = Instance.new("Highlight")
+	highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+	highlight.Enabled = false
+	highlight.Parent = gethui()
 
-	local objects = {
-		box = Drawing.new("Square"),
-		boxOutline = Drawing.new("Square"),
-		name = Drawing.new("Text"),
-		distance = Drawing.new("Text"),
-		healthBack = Drawing.new("Square"),
-		health = Drawing.new("Square"),
-		tracer = Drawing.new("Line"),
-		bones = {},
+	local entry = {
+		highlight = highlight,
+		drawings = {
+			boxOutline = newDrawing("Square", { Thickness = 3, Filled = false, Color = Color3.new(0, 0, 0) }),
+			box = newDrawing("Square", { Thickness = 1, Filled = false }),
+			healthBack = newDrawing("Line", { Thickness = 3, Color = Color3.new(0, 0, 0) }),
+			healthFill = newDrawing("Line", { Thickness = 1 }),
+			name = newDrawing("Text", { Size = 13, Center = true, Outline = true, Font = ESP_FONT }),
+			info = newDrawing("Text", { Size = 12, Center = true, Outline = true, Font = ESP_FONT }),
+			tracer = newDrawing("Line", { Thickness = 1 }),
+		},
 	}
-
-	objects.box.Filled = false
-	objects.box.Thickness = 1
-	objects.boxOutline.Filled = false
-	objects.boxOutline.Thickness = 3
-	objects.boxOutline.Color = Color3.new(0, 0, 0)
-	objects.name.Center = true
-	objects.name.Outline = true
-	objects.name.Size = 14
-	objects.distance.Center = true
-	objects.distance.Outline = true
-	objects.distance.Size = 12
-	objects.distance.Color = Color3.fromRGB(160, 140, 140)
-	objects.healthBack.Filled = true
-	objects.healthBack.Color = Color3.new(0, 0, 0)
-	objects.health.Filled = true
-	objects.tracer.Thickness = 1
-
-	for index = 1, #SKELETON_LINKS do
-		local line = Drawing.new("Line")
-		line.Thickness = 1.5
-		objects.bones[index] = line
-	end
-
-	StreetLife.espObjects[player] = objects
+	Potent.esp[player] = entry
+	return entry
 end
 
----Hide every drawing of a player's ESP.
----@param objects table
-local function hideEsp(objects)
-	for key, drawing in pairs(objects) do
-		if key == "bones" then
-			for _, line in ipairs(drawing) do
-				line.Visible = false
-			end
-		else
-			drawing.Visible = false
-		end
+---Hide every ESP object of an entry.
+---@param entry table
+local function hideEsp(entry)
+	for _, drawing in pairs(entry.drawings) do
+		drawing.Visible = false
 	end
+	entry.highlight.Enabled = false
 end
 
----Remove and destroy a player's ESP drawings.
+---Destroy the ESP objects of a player.
 ---@param player Player
-local function removeEsp(player)
-	local objects = StreetLife.espObjects[player]
-	if not objects then
+local function destroyEsp(player)
+	local entry = Potent.esp[player]
+	if not entry then
 		return
 	end
-
-	for key, drawing in pairs(objects) do
-		if key == "bones" then
-			for _, line in ipairs(drawing) do
-				line:Remove()
-			end
-		else
-			drawing:Remove()
-		end
+	for _, drawing in pairs(entry.drawings) do
+		pcall(drawing.Remove, drawing)
 	end
-
-	StreetLife.espObjects[player] = nil
+	entry.highlight:Destroy()
+	Potent.esp[player] = nil
 end
 
----Update every ESP drawing for the current frame.
+---Draw ESP for every player.
 ---@param camera Camera
 local function updateEsp(camera)
-	local Toggles, Options = getgenv().Toggles, getgenv().Options
 	local enabled = Toggles.EspEnabled.Value
-	local color = Options.EspColor.Value
-	local viewportSize = camera.ViewportSize
+	local viewport = camera.ViewportSize
+	local cameraPosition = camera.CFrame.Position
 
-	for player, objects in pairs(StreetLife.espObjects) do
-		hideEsp(objects)
+	for _, player in ipairs(playersService:GetPlayers()) do
+		if player == localPlayer then
+			continue
+		end
 
-		if not enabled then continue end
+		local entry = Potent.esp[player] or createEsp(player)
+		hideEsp(entry)
 
 		local character = player.Character
 		local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-		local rootPart = character and character:FindFirstChild("HumanoidRootPart")
-		if not (humanoid and rootPart and humanoid.Health > 0) then continue end
+		local root = character and character:FindFirstChild("HumanoidRootPart")
+		local head = character and character:FindFirstChild("Head")
+		if not enabled or not humanoid or not root or not head or humanoid.Health <= 0 or not isInMatch(player) then
+			continue
+		end
 
-		local torso = findPart(character, TORSO_NAMES) or rootPart
-		local distance = (camera.CFrame.Position - torso.Position).Magnitude
-		if distance > Options.EspMaxDistance.Value then continue end
+		local teammate = isTeammate(player)
+		if teammate and not Toggles.EspTeammates.Value then
+			continue
+		end
 
-		local center, onScreen = camera:WorldToViewportPoint(torso.Position)
-		if not onScreen then continue end
+		local distance = (root.Position - cameraPosition).Magnitude
+		if distance > Options.EspDistanceMax.Value then
+			continue
+		end
 
-		local top = camera:WorldToViewportPoint(torso.Position + ESP_HEAD_OFFSET)
-		local bottom = camera:WorldToViewportPoint(torso.Position - ESP_FEET_OFFSET)
-		local height = math.abs(top.Y - bottom.Y)
-		if height < 1 then continue end
+		local color = teammate and Options.TeamColor.Value or Options.EnemyColor.Value
+		local drawings = entry.drawings
 
-		local width = height / ESP_BOX_RATIO
+		if Toggles.Chams.Value then
+			entry.highlight.Adornee = character
+			entry.highlight.FillColor = color
+			entry.highlight.OutlineColor = color
+			entry.highlight.FillTransparency = Options.ChamsFill.Value / 100
+			entry.highlight.Enabled = true
+		end
 
-		if Toggles.EspBoxes.Value then
-			objects.boxOutline.Size = Vector2.new(width + 2, height + 2)
-			objects.boxOutline.Position = Vector2.new(center.X - width / 2 - 1, top.Y - 1)
-			objects.boxOutline.Visible = true
-			objects.box.Size = Vector2.new(width, height)
-			objects.box.Position = Vector2.new(center.X - width / 2, top.Y)
-			objects.box.Color = color
-			objects.box.Visible = true
+		local top = camera:WorldToViewportPoint(head.Position + Vector3.new(0, 0.7, 0))
+		local bottom = camera:WorldToViewportPoint(root.Position - Vector3.new(0, 3, 0))
+		if top.Z <= 0 or bottom.Z <= 0 then
+			continue
+		end
+
+		local height = math.abs(bottom.Y - top.Y)
+		local width = height * BOX_ASPECT
+		local left = top.X - width / 2
+		local feet = Vector2.new(top.X, top.Y + height)
+
+		if Toggles.EspBox.Value then
+			drawings.boxOutline.Position = Vector2.new(left, top.Y)
+			drawings.boxOutline.Size = Vector2.new(width, height)
+			drawings.boxOutline.Visible = true
+			drawings.box.Position = Vector2.new(left, top.Y)
+			drawings.box.Size = Vector2.new(width, height)
+			drawings.box.Color = color
+			drawings.box.Visible = true
 		end
 
 		if Toggles.EspHealth.Value then
-			local percent = math.clamp(humanoid.Health / humanoid.MaxHealth, 0, 1)
-			objects.healthBack.Size = Vector2.new(3, height + 2)
-			objects.healthBack.Position = Vector2.new(center.X - width / 2 - 6, top.Y - 1)
-			objects.healthBack.Visible = true
-			objects.health.Size = Vector2.new(1, math.max(height * percent, 1))
-			objects.health.Position = Vector2.new(center.X - width / 2 - 5, top.Y + height * (1 - percent))
-			objects.health.Color = Color3.fromHSV(percent * 0.3, 1, 1)
-			objects.health.Visible = true
+			local ratio = math.clamp(humanoid.Health / math.max(humanoid.MaxHealth, 1), 0, 1)
+			local x = left - 5
+			drawings.healthBack.From = Vector2.new(x, feet.Y)
+			drawings.healthBack.To = Vector2.new(x, top.Y)
+			drawings.healthBack.Visible = true
+			drawings.healthFill.From = Vector2.new(x, feet.Y)
+			drawings.healthFill.To = Vector2.new(x, feet.Y - height * ratio)
+			drawings.healthFill.Color = Color3.fromHSV(ratio * 0.33, 1, 1)
+			drawings.healthFill.Visible = true
 		end
 
-		if Toggles.EspNames.Value then
-			objects.name.Text = player.Name
-			objects.name.Position = Vector2.new(center.X, top.Y - 18)
-			objects.name.Color = color
-			objects.name.Visible = true
+		if Toggles.EspName.Value then
+			drawings.name.Text = player.DisplayName
+			drawings.name.Position = Vector2.new(top.X, top.Y - 16)
+			drawings.name.Color = color
+			drawings.name.Visible = true
 		end
 
-		if Toggles.EspShowDistance.Value then
-			objects.distance.Text = string.format("[%dm]", math.floor(distance))
-			objects.distance.Position = Vector2.new(center.X, bottom.Y + 2)
-			objects.distance.Visible = true
+		local infoParts = {}
+		if Toggles.EspDistance.Value then
+			table.insert(infoParts, string.format("%d studs", distance))
 		end
-
-		if Toggles.EspTracers.Value then
-			objects.tracer.From = Vector2.new(viewportSize.X / 2, viewportSize.Y)
-			objects.tracer.To = Vector2.new(center.X, bottom.Y)
-			objects.tracer.Color = color
-			objects.tracer.Visible = true
-		end
-
-		if Toggles.EspSkeleton.Value then
-			for index, link in ipairs(SKELETON_LINKS) do
-				local partA, partB = findPart(character, link[1]), findPart(character, link[2])
-				if not (partA and partB) then continue end
-
-				local pointA, visibleA = camera:WorldToViewportPoint(partA.Position)
-				local pointB, visibleB = camera:WorldToViewportPoint(partB.Position)
-				if not (visibleA and visibleB) then continue end
-
-				local line = objects.bones[index]
-				line.From = Vector2.new(pointA.X, pointA.Y)
-				line.To = Vector2.new(pointB.X, pointB.Y)
-				line.Color = color
-				line.Visible = true
+		if Toggles.EspTool.Value then
+			local tool = character:FindFirstChildOfClass("Tool")
+			if tool then
+				table.insert(infoParts, tool.Name)
 			end
 		end
-	end
-end
-
----Move the cursor toward the closest target while the aim key is held.
----@param camera Camera
-local function updateAimbot(camera)
-	local Toggles, Options = getgenv().Toggles, getgenv().Options
-	local mousePos = userInputService:GetMouseLocation()
-
-	StreetLife.fovCircle.Position = mousePos
-	StreetLife.fovCircle.Radius = Options.AimFovRadius.Value
-	StreetLife.fovCircle.Visible = Toggles.AimShowFov.Value
-
-	if not (Toggles.AimbotEnabled.Value and Options.AimbotKey:GetState()) then
-		return
-	end
-
-	local part = getClosestTarget(camera)
-	if not part then
-		return
-	end
-
-	local predicted = part.Position
-	local rootPart = part.Parent:FindFirstChild("HumanoidRootPart")
-	if rootPart and Options.AimPrediction.Value > 0 then
-		predicted = predicted + rootPart.AssemblyLinearVelocity * Options.AimPrediction.Value
-	end
-
-	local screenPos, onScreen = camera:WorldToViewportPoint(predicted)
-	if not onScreen then
-		return
-	end
-
-	local smoothness = Options.AimSmoothness.Value
-	if mousemoverel then
-		local jitterX = (math.random() - 0.5) * 2 * AIM_JITTER_PX
-		local jitterY = (math.random() - 0.5) * 2 * AIM_JITTER_PX
-		mousemoverel((screenPos.X - mousePos.X) / smoothness + jitterX, (screenPos.Y - mousePos.Y) / smoothness + jitterY)
-		return
-	end
-
-	camera.CFrame = camera.CFrame:Lerp(CFrame.new(camera.CFrame.Position, predicted), 1 / (smoothness * 2))
-end
-
----Counter vertical camera kick while the fire button is held.
----@param camera Camera
-local function updateNoRecoil(camera)
-	if not (getgenv().Toggles.NoRecoil.Value and StreetLife.shooting and mousemoverel) then
-		StreetLife.lastPitch = nil
-		return
-	end
-
-	local _, pitch = camera.CFrame:ToEulerAnglesYXZ()
-	if StreetLife.lastPitch then
-		local delta = (pitch - StreetLife.lastPitch) * RECOIL_DIRECTION
-		if delta > RECOIL_PITCH_THRESHOLD then
-			mousemoverel(0, math.deg(delta) * (camera.ViewportSize.Y / camera.FieldOfView) * RECOIL_COMPENSATION)
-		end
-	end
-
-	StreetLife.lastPitch = pitch
-end
-
----Apply the custom field of view, restoring the original when disabled.
----@param camera Camera
-local function updateCameraFov(camera)
-	local Toggles, Options = getgenv().Toggles, getgenv().Options
-	if Toggles.CustomFov.Value then
-		StreetLife.savedFieldOfView = StreetLife.savedFieldOfView or camera.FieldOfView
-		camera.FieldOfView = Options.FovValue.Value
-	elseif StreetLife.savedFieldOfView then
-		camera.FieldOfView = StreetLife.savedFieldOfView
-		StreetLife.savedFieldOfView = nil
-	end
-end
-
----Update the fps counter overlay.
-local function updateFps()
-	StreetLife.fpsFrames = StreetLife.fpsFrames + 1
-	if os.clock() - StreetLife.fpsTimestamp >= 1 then
-		StreetLife.currentFps = StreetLife.fpsFrames
-		StreetLife.fpsFrames = 0
-		StreetLife.fpsTimestamp = os.clock()
-	end
-
-	StreetLife.fpsLabel.Text = "FPS: " .. StreetLife.currentFps
-	StreetLife.fpsLabel.Visible = getgenv().Toggles.ShowFps.Value
-end
-
----Apply walk speed and jump power modifiers for the current frame.
----@param humanoid Humanoid
-local function updateMovement(humanoid)
-	local Toggles, Options = getgenv().Toggles, getgenv().Options
-
-	if Toggles.SpeedEnabled.Value then
-		StreetLife.savedWalkSpeed = StreetLife.savedWalkSpeed or humanoid.WalkSpeed
-		humanoid.WalkSpeed = Options.SpeedValue.Value
-	elseif StreetLife.savedWalkSpeed then
-		humanoid.WalkSpeed = StreetLife.savedWalkSpeed
-		StreetLife.savedWalkSpeed = nil
-	end
-
-	if Toggles.JumpEnabled.Value then
-		StreetLife.savedJumpPower = StreetLife.savedJumpPower or humanoid.JumpPower
-		humanoid.UseJumpPower = true
-		humanoid.JumpPower = Options.JumpValue.Value
-	elseif StreetLife.savedJumpPower then
-		humanoid.JumpPower = StreetLife.savedJumpPower
-		StreetLife.savedJumpPower = nil
-	end
-end
-
----Apply infinite ammo and fast reload to the equipped tool.
----@param character Model
----@param humanoid Humanoid
-local function updateGunMods(character, humanoid)
-	local Toggles, Options = getgenv().Toggles, getgenv().Options
-	local tool = character:FindFirstChildOfClass("Tool")
-	if not tool then
-		return
-	end
-
-	if Toggles.InfAmmo.Value and os.clock() - StreetLife.lastAmmoScan >= AMMO_SCAN_INTERVAL then
-		StreetLife.lastAmmoScan = os.clock()
-
-		for _, descendant in ipairs(tool:GetDescendants()) do
-			if (descendant:IsA("IntValue") or descendant:IsA("NumberValue")) and matchesKeyword(descendant.Name, AMMO_KEYWORDS) then
-				descendant.Value = INF_AMMO_VALUE
-			end
+		if #infoParts > 0 then
+			drawings.info.Text = table.concat(infoParts, " | ")
+			drawings.info.Position = Vector2.new(top.X, feet.Y + 2)
+			drawings.info.Color = color
+			drawings.info.Visible = true
 		end
 
-		for name, value in pairs(tool:GetAttributes()) do
-			if type(value) == "number" and matchesKeyword(name, AMMO_KEYWORDS) then
-				tool:SetAttribute(name, INF_AMMO_VALUE)
-			end
-		end
-	end
-
-	if Toggles.FastReload.Value then
-		for _, track in ipairs(humanoid:GetPlayingAnimationTracks()) do
-			if matchesKeyword(track.Name, { "reload" }) then
-				track:AdjustSpeed(Options.ReloadSpeed.Value)
-			end
+		if Toggles.EspTracer.Value then
+			drawings.tracer.From = Vector2.new(viewport.X / 2, viewport.Y)
+			drawings.tracer.To = feet
+			drawings.tracer.Color = color
+			drawings.tracer.Visible = true
 		end
 	end
 end
 
----Disable collisions on the local character while noclip is active.
----@param character Model
-local function updateNoclip(character)
-	if not getgenv().Toggles.Noclip.Value then
+---Update the FOV circles.
+local function updateCircles()
+	local mousePosition = userInputService:GetMouseLocation()
+	local aimCircle = Potent.circles.aim
+	local silentCircle = Potent.circles.silent
+
+	aimCircle.Visible = Toggles.AimbotEnabled.Value and Toggles.DrawAimbotFov.Value
+	aimCircle.Position = mousePosition
+	aimCircle.Radius = Options.AimbotFov.Value
+	aimCircle.Color = Options.FovColor.Value
+
+	silentCircle.Visible = Toggles.SilentAimEnabled.Value and Toggles.DrawSilentFov.Value
+	silentCircle.Position = mousePosition
+	silentCircle.Radius = Options.SilentFov.Value
+	silentCircle.Color = Options.SilentFovColor.Value
+end
+
+---Restore the lighting properties changed by the world toggles.
+local function restoreLighting()
+	if not lightingCache then
+		return
+	end
+	for property, value in pairs(lightingCache.properties) do
+		lightingService[property] = value
+	end
+	if lightingCache.atmosphere then
+		lightingCache.atmosphere.Density = lightingCache.density
+	end
+	lightingCache = nil
+end
+
+---Apply fullbright and no fog.
+local function updateLighting()
+	local fullbright = Toggles.Fullbright.Value
+	local noFog = Toggles.NoFog.Value
+	if not fullbright and not noFog then
+		restoreLighting()
 		return
 	end
 
-	for _, part in ipairs(character:GetDescendants()) do
-		if part:IsA("BasePart") and part.CanCollide then
-			part.CanCollide = false
+	if not lightingCache then
+		local atmosphere = lightingService:FindFirstChildOfClass("Atmosphere")
+		lightingCache = {
+			atmosphere = atmosphere,
+			density = atmosphere and atmosphere.Density,
+			properties = {
+				Brightness = lightingService.Brightness,
+				ClockTime = lightingService.ClockTime,
+				GlobalShadows = lightingService.GlobalShadows,
+				Ambient = lightingService.Ambient,
+				OutdoorAmbient = lightingService.OutdoorAmbient,
+				FogEnd = lightingService.FogEnd,
+			},
+		}
+	end
+
+	if fullbright then
+		lightingService.Brightness = 2
+		lightingService.ClockTime = 14
+		lightingService.GlobalShadows = false
+		lightingService.Ambient = Color3.new(1, 1, 1)
+		lightingService.OutdoorAmbient = Color3.new(1, 1, 1)
+	end
+	if noFog then
+		lightingService.FogEnd = 1e6
+		if lightingCache.atmosphere then
+			lightingCache.atmosphere.Density = 0
 		end
 	end
 end
 
----Apply car fly and ground speed boost to the driven vehicle.
----@param humanoid Humanoid
----@param camera Camera
----@param deltaTime number
-local function updateCar(humanoid, camera, deltaTime)
-	local Toggles, Options = getgenv().Toggles, getgenv().Options
-	local seat = getVehicleSeat(humanoid)
-	if not seat then
-		return
-	end
-
-	local speed = Options.CarSpeedAmount.Value
-
-	if Toggles.CarFly.Value then
-		local velocity = Vector3.zero
-		if userInputService:IsKeyDown(Enum.KeyCode.W) then velocity = velocity + camera.CFrame.LookVector * speed end
-		if userInputService:IsKeyDown(Enum.KeyCode.S) then velocity = velocity - camera.CFrame.LookVector * speed end
-		if userInputService:IsKeyDown(Enum.KeyCode.A) then velocity = velocity - camera.CFrame.RightVector * speed end
-		if userInputService:IsKeyDown(Enum.KeyCode.D) then velocity = velocity + camera.CFrame.RightVector * speed end
-
-		seat.AssemblyLinearVelocity = velocity
-		seat.AssemblyAngularVelocity = Vector3.zero
-		return
-	end
-
-	if Toggles.CarSpeed.Value and seat.AssemblyLinearVelocity.Magnitude > CAR_GROUND_MIN_SPEED then
-		seat.AssemblyLinearVelocity = seat.AssemblyLinearVelocity + seat.CFrame.LookVector * (speed * deltaTime)
-	end
-end
-
----Refill stamina style values found under a container.
----@param container Instance
-local function refillStamina(container)
-	for _, descendant in ipairs(container:GetDescendants()) do
-		if (descendant:IsA("NumberValue") or descendant:IsA("IntValue")) and matchesKeyword(descendant.Name, STAMINA_KEYWORDS) then
-			if descendant.Value < STAMINA_REFILL_THRESHOLD then
-				descendant.Value = STAMINA_MAX
-			end
-		end
-	end
-end
-
----Keep stamina style values and attributes topped up while enabled.
-local function staminaLoop()
-	while StreetLife.running do
-		task.wait(STAMINA_INTERVAL)
-
-		if not getgenv().Toggles.InfStamina.Value then continue end
-
-		local character = localPlayer.Character
-		if character then
-			refillStamina(character)
-
-			for name, value in pairs(character:GetAttributes()) do
-				if type(value) == "number" and matchesKeyword(name, STAMINA_KEYWORDS) then
-					character:SetAttribute(name, math.max(value, STAMINA_ATTRIBUTE_FLOOR))
-				end
-			end
-		end
-
-		refillStamina(localPlayer)
-	end
-end
-
----Hook the local humanoid so health is pinned while god mode is enabled.
-local function setupGodMode()
-	if StreetLife.godConnection then
-		StreetLife.godConnection:Disconnect()
-		StreetLife.godConnection = nil
-	end
-
-	if not getgenv().Toggles.GodMode.Value then
-		return
-	end
-
-	local _, humanoid = getLocalParts()
-	if not humanoid then
-		return
-	end
-
-	humanoid.MaxHealth = math.huge
-	humanoid.Health = math.huge
-
-	StreetLife.godConnection = humanoid.HealthChanged:Connect(function()
-		if getgenv().Toggles.GodMode.Value then
-			humanoid.Health = math.huge
-		end
-	end)
-end
-
----Restore the default health values after god mode is disabled.
-local function teardownGodMode()
-	if StreetLife.godConnection then
-		StreetLife.godConnection:Disconnect()
-		StreetLife.godConnection = nil
-	end
-
-	local _, humanoid = getLocalParts()
-	if humanoid then
-		humanoid.MaxHealth = DEFAULT_MAX_HEALTH
-		humanoid.Health = DEFAULT_MAX_HEALTH
-	end
-end
-
----Detach the script and clean up everything it owns.
-function StreetLife.detach()
-	StreetLife.running = false
-
-	for _, connection in ipairs(StreetLife.connections) do
-		connection:Disconnect()
-	end
-
-	for player in pairs(StreetLife.espObjects) do
-		removeEsp(player)
-	end
-
-	if StreetLife.fovCircle then
-		StreetLife.fovCircle:Remove()
-	end
-
-	if StreetLife.fpsLabel then
-		StreetLife.fpsLabel:Remove()
-	end
-
+---Render step callback.
+local function onRender()
 	local camera = workspace.CurrentCamera
-	if camera and StreetLife.savedFieldOfView then
-		camera.FieldOfView = StreetLife.savedFieldOfView
+	if not camera then
+		return
 	end
 
-	local _, humanoid = getLocalParts()
-	if humanoid then
-		if StreetLife.savedWalkSpeed then
-			humanoid.WalkSpeed = StreetLife.savedWalkSpeed
-		end
+	updateCircles()
+	updateAimbot(camera)
+	updateTriggerbot()
+	updateEsp(camera)
+	updateLighting()
 
-		if StreetLife.savedJumpPower then
-			humanoid.JumpPower = StreetLife.savedJumpPower
-		end
+	if Toggles.FovChanger.Value then
+		camera.FieldOfView = Options.FovValue.Value
 	end
-
-	teardownGodMode()
-	table.clear(StreetLife.connections)
-	shared.StreetLife = nil
 end
 
----Build the menu and wire up every feature.
-function StreetLife.init()
-	local Library = fetch("Library.lua")
-	local ThemeManager = fetch("addons/ThemeManager.lua")
-	local SaveManager = fetch("addons/SaveManager.lua")
-	local Toggles, Options = getgenv().Toggles, getgenv().Options
-	StreetLife.library = Library
+---Heartbeat callback.
+---@param deltaTime number
+local function onHeartbeat(deltaTime)
+	trackVelocities(deltaTime)
 
-	StreetLife.fovCircle = Drawing.new("Circle")
-	StreetLife.fovCircle.Thickness = 1.5
-	StreetLife.fovCircle.Filled = false
-	StreetLife.fovCircle.Color = Color3.fromRGB(220, 20, 60)
-	StreetLife.fovCircle.Visible = false
+	if not Toggles.SpeedBoost.Value then
+		return
+	end
+	local character = localPlayer.Character
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	local root = character and character:FindFirstChild("HumanoidRootPart")
+	if humanoid and root and humanoid.MoveDirection.Magnitude > 0 then
+		root.CFrame += humanoid.MoveDirection * Options.SpeedValue.Value * deltaTime
+	end
+end
 
-	StreetLife.fpsLabel = Drawing.new("Text")
-	StreetLife.fpsLabel.Size = 16
-	StreetLife.fpsLabel.Outline = true
-	StreetLife.fpsLabel.Color = Color3.fromRGB(220, 20, 60)
-	StreetLife.fpsLabel.Position = Vector2.new(15, 15)
-	StreetLife.fpsLabel.Visible = false
+---Stepped callback.
+local function onStepped()
+	if not Toggles.Noclip.Value then
+		return
+	end
+	local character = localPlayer.Character
+	if not character then
+		return
+	end
+	for _, descendant in ipairs(character:GetDescendants()) do
+		if descendant:IsA("BasePart") then
+			descendant.CanCollide = false
+		end
+	end
+end
 
-	local window = Library:CreateWindow({ Title = MENU_TITLE, Center = true, AutoShow = true })
-	local tabs = {
-		combat = window:AddTab("Combat"),
-		visuals = window:AddTab("Visuals"),
-		player = window:AddTab("Player"),
-		teleports = window:AddTab("Teleports"),
-		settings = window:AddTab("Settings"),
+---Detach this instance and clean up everything it created.
+function Potent.detach()
+	if Potent.unloaded then
+		return
+	end
+	Potent.unloaded = true
+
+	pcall(runService.UnbindFromRenderStep, runService, RENDER_STEP_NAME)
+	for _, connection in ipairs(Potent.connections) do
+		pcall(connection.Disconnect, connection)
+	end
+	for player in pairs(Potent.esp) do
+		destroyEsp(player)
+	end
+	for _, circle in pairs(Potent.circles) do
+		pcall(circle.Remove, circle)
+	end
+
+	removeSilentAim()
+	restoreLighting()
+	releaseTrigger()
+
+	if Library then
+		pcall(Library.Unload, Library)
+	end
+	getgenv().Toggles = nil
+	getgenv().Options = nil
+end
+
+---Build the menu.
+---@param ThemeManager table
+---@param SaveManager table
+local function buildMenu(ThemeManager, SaveManager)
+	local Window = Library:CreateWindow({
+		Title = MENU_TITLE,
+		Center = true,
+		AutoShow = false,
+		TabPadding = 8,
+		MenuFadeTime = 0.2,
+	})
+
+	local Tabs = {
+		Combat = Window:AddTab("Combat"),
+		Visuals = Window:AddTab("Visuals"),
+		Player = Window:AddTab("Player"),
+		Settings = Window:AddTab("UI Settings"),
 	}
 
+	local partValues = { "Head", "UpperTorso", "HumanoidRootPart", "Random" }
+
 	-- Aimbot.
-	local aimBox = tabs.combat:AddLeftGroupbox("Aimbot")
-	aimBox:AddToggle("AimbotEnabled", { Text = "Enable aimbot", Default = false })
-	Toggles.AimbotEnabled:AddKeyPicker("AimbotKey", { Default = "MB2", Mode = "Hold", Text = "Aimbot key", NoUI = false })
-	aimBox:AddSlider("AimSmoothness", { Text = "Smoothness (1 = instant)", Default = 2, Min = 1, Max = 10, Rounding = 0 })
-	aimBox:AddSlider("AimPrediction", { Text = "Prediction", Default = 0.14, Min = 0, Max = 0.5, Rounding = 2 })
-	aimBox:AddToggle("AimShowFov", { Text = "Show FOV circle", Default = false })
-	aimBox:AddSlider("AimFovRadius", { Text = "FOV radius", Default = 150, Min = 10, Max = 500, Rounding = 0, Suffix = " px" })
-	aimBox:AddDropdown("AimTargetPart", { Values = AIM_TARGET_PARTS, Default = 1, Text = "Target part" })
-	aimBox:AddToggle("AimWallCheck", { Text = "Wall check", Default = true })
+	local aimbotBox = Tabs.Combat:AddLeftGroupbox("Aimbot")
+	aimbotBox:AddToggle("AimbotEnabled", { Text = "Enabled", Default = false }):AddKeyPicker("AimbotKey", {
+		Default = "MB2",
+		Mode = "Hold",
+		SyncToggleState = false,
+		Text = "Aimbot",
+		NoUI = false,
+	})
+	aimbotBox:AddDropdown("AimbotMethod", { Values = { "Mouse", "Camera" }, Default = 1, Text = "Method" })
+	aimbotBox:AddDropdown("AimbotPart", { Values = partValues, Default = 1, Text = "Target part" })
+	aimbotBox:AddSlider("AimbotFov", { Text = "FOV", Default = 120, Min = 10, Max = 600, Rounding = 0 })
+	aimbotBox:AddSlider("AimbotSmoothing", { Text = "Smoothing", Default = 70, Min = 0, Max = 98, Rounding = 0 })
+	aimbotBox:AddToggle("AimbotWallCheck", { Text = "Wall check", Default = true })
+	aimbotBox:AddToggle("StickyAim", { Text = "Sticky target", Default = false })
 
-	-- Gun mods.
-	local gunBox = tabs.combat:AddRightGroupbox("Gun mods")
-	gunBox:AddToggle("InfAmmo", { Text = "Infinite ammo", Default = false })
-	gunBox:AddToggle("FastReload", { Text = "Fast reload", Default = false })
-	gunBox:AddSlider("ReloadSpeed", { Text = "Reload speed", Default = 3, Min = 1, Max = 10, Rounding = 1, Suffix = "x" })
-	gunBox:AddToggle("NoRecoil", { Text = "No recoil", Default = false })
+	-- Targeting shared by every combat feature.
+	local sharedBox = Tabs.Combat:AddLeftGroupbox("Targeting")
+	sharedBox:AddToggle("TeamCheck", { Text = "Team check", Default = true })
+	sharedBox:AddToggle("Prediction", { Text = "Lead moving targets", Default = true })
+	sharedBox:AddSlider("PredictionScale", { Text = "Lead scale", Default = 1, Min = 0, Max = 2, Rounding = 2 })
+	sharedBox:AddToggle("DropCompensation", { Text = "Projectile drop compensation", Default = true })
 
-	-- Visuals.
-	local espBox = tabs.visuals:AddLeftGroupbox("Player ESP")
-	espBox:AddToggle("EspEnabled", { Text = "Enable ESP", Default = false })
-	Toggles.EspEnabled:AddColorPicker("EspColor", { Default = Color3.fromRGB(220, 20, 60), Title = "ESP color" })
-	espBox:AddSlider("EspMaxDistance", { Text = "Max distance", Default = 1000, Min = 100, Max = 2000, Rounding = 0, Suffix = " studs" })
-	espBox:AddToggle("EspBoxes", { Text = "Boxes", Default = true })
-	espBox:AddToggle("EspSkeleton", { Text = "Skeleton", Default = false })
-	espBox:AddToggle("EspNames", { Text = "Names", Default = true })
-	espBox:AddToggle("EspHealth", { Text = "Health bar", Default = false })
-	espBox:AddToggle("EspShowDistance", { Text = "Distance", Default = true })
-	espBox:AddToggle("EspTracers", { Text = "Tracers", Default = false })
+	-- Silent aim.
+	local silentBox = Tabs.Combat:AddRightGroupbox("Silent Aim")
+	silentBox:AddToggle("SilentAimEnabled", { Text = "Enabled", Default = false })
+	silentBox:AddDropdown("SilentPart", { Values = partValues, Default = 1, Text = "Target part" })
+	silentBox:AddSlider("SilentFov", { Text = "FOV", Default = 150, Min = 10, Max = 800, Rounding = 0 })
+	silentBox:AddSlider("SilentHitChance", { Text = "Hit chance", Default = 100, Min = 1, Max = 100, Rounding = 0 })
+	silentBox:AddToggle("SilentWallCheck", { Text = "Wall check", Default = true })
 
-	local miscVisualsBox = tabs.visuals:AddRightGroupbox("Misc")
-	miscVisualsBox:AddToggle("CustomFov", { Text = "Custom FOV", Default = false })
-	miscVisualsBox:AddSlider("FovValue", { Text = "FOV", Default = 100, Min = 70, Max = 120, Rounding = 0 })
-	miscVisualsBox:AddToggle("ShowFps", { Text = "FPS counter", Default = false })
-
-	-- Player.
-	local playerBox = tabs.player:AddLeftGroupbox("Player")
-	playerBox:AddToggle("GodMode", { Text = "No fall damage / god", Default = false })
-	playerBox:AddToggle("InfStamina", { Text = "Infinite stamina", Default = false })
-	playerBox:AddToggle("Noclip", { Text = "Noclip", Default = false })
-	playerBox:AddToggle("InfiniteJump", { Text = "Infinite jump", Default = false })
-	playerBox:AddToggle("SpeedEnabled", { Text = "Walk speed", Default = false })
-	playerBox:AddSlider("SpeedValue", { Text = "Speed", Default = 24, Min = 16, Max = 80, Rounding = 0 })
-	playerBox:AddToggle("JumpEnabled", { Text = "Jump power", Default = false })
-	playerBox:AddSlider("JumpValue", { Text = "Power", Default = 70, Min = 50, Max = 200, Rounding = 0 })
-
-	Toggles.GodMode:OnChanged(function()
-		if Toggles.GodMode.Value then
-			setupGodMode()
-			notify("God mode enabled")
+	Toggles.SilentAimEnabled:OnChanged(function()
+		if Toggles.SilentAimEnabled.Value then
+			installSilentAim()
 		else
-			teardownGodMode()
-			notify("God mode disabled")
+			removeSilentAim()
 		end
 	end)
 
-	local carBox = tabs.player:AddRightGroupbox("Vehicle")
-	carBox:AddToggle("CarFly", { Text = "Car fly (WASD + camera)", Default = false })
-	Toggles.CarFly:AddKeyPicker("CarFlyKey", { Default = "F", Mode = "Toggle", SyncToggleState = true, Text = "Car fly", NoUI = false })
-	carBox:AddSlider("CarSpeedAmount", { Text = "Fly / boost speed", Default = 150, Min = 50, Max = 500, Rounding = 0 })
-	carBox:AddToggle("CarSpeed", { Text = "Ground speed boost", Default = false })
+	-- Triggerbot.
+	local triggerBox = Tabs.Combat:AddRightGroupbox("Triggerbot")
+	triggerBox:AddToggle("TriggerbotEnabled", { Text = "Enabled", Default = false })
+	triggerBox:AddDropdown("TriggerPart", { Values = partValues, Default = 2, Text = "Target part" })
+	triggerBox:AddSlider("TriggerFov", { Text = "Trigger radius", Default = 25, Min = 5, Max = 150, Rounding = 0 })
+	triggerBox:AddSlider("TriggerHold", { Text = "Hold time (draw)", Default = 0.1, Min = 0, Max = 1.5, Rounding = 2 })
 
-	-- Teleports.
-	local carTeleportBox = tabs.teleports:AddLeftGroupbox("Vehicle teleports")
-	carTeleportBox:AddDropdown("CarTeleportTarget", { Values = collectCarTeleports(), Default = 1, Text = "Location" })
-	carTeleportBox:AddButton({
-		Text = "Teleport vehicle",
-		Func = function()
-			local position = getCarTeleportPosition(Options.CarTeleportTarget.Value)
-			if position then
-				teleportCar(position)
-			end
-		end,
-	})
+	-- ESP.
+	local espBox = Tabs.Visuals:AddLeftGroupbox("ESP")
+	espBox:AddToggle("EspEnabled", { Text = "Enabled", Default = false })
+	espBox:AddToggle("EspTeammates", { Text = "Show teammates", Default = false })
+	espBox:AddToggle("EspBox", { Text = "Box", Default = true })
+	espBox:AddToggle("EspName", { Text = "Name", Default = true })
+	espBox:AddToggle("EspHealth", { Text = "Health bar", Default = true })
+	espBox:AddToggle("EspDistance", { Text = "Distance", Default = true })
+	espBox:AddToggle("EspTool", { Text = "Held weapon", Default = true })
+	espBox:AddToggle("EspTracer", { Text = "Tracers", Default = false })
+	espBox:AddSlider("EspDistanceMax", { Text = "Max distance", Default = 1500, Min = 100, Max = 5000, Rounding = 0 })
 
-	local doorsBox = tabs.teleports:AddRightGroupbox("Doors")
-	doorsBox:AddDropdown("DoorTarget", { Values = collectChildNames(TELEPORTS_FOLDER_NAME), Default = 1, Text = "Door" })
-	doorsBox:AddButton({
-		Text = "Teleport",
-		Func = function()
-			local folder = workspace:FindFirstChild(TELEPORTS_FOLDER_NAME)
-			local door = folder and folder:FindFirstChild(Options.DoorTarget.Value)
-			if door and door:IsA("BasePart") then
-				teleportTo(door.Position)
-			end
-		end,
-	})
+	local chamsBox = Tabs.Visuals:AddLeftGroupbox("Chams")
+	chamsBox:AddToggle("Chams", { Text = "Enabled", Default = false })
+	chamsBox:AddSlider("ChamsFill", { Text = "Fill transparency", Default = 60, Min = 0, Max = 100, Rounding = 0 })
 
-	local landmarksBox = tabs.teleports:AddLeftGroupbox("Landmarks")
-	landmarksBox:AddDropdown("LandmarkTarget", { Values = collectLandmarks(), Default = 1, Text = "Landmark" })
-	landmarksBox:AddButton({
-		Text = "Teleport",
-		Func = function()
-			local position = getLandmarkPosition(Options.LandmarkTarget.Value)
-			if position then
-				teleportTo(position)
-			end
-		end,
-	})
+	-- Colors.
+	local colorBox = Tabs.Visuals:AddRightGroupbox("Colors")
+	colorBox:AddLabel("Enemy"):AddColorPicker("EnemyColor", { Default = Color3.fromRGB(255, 70, 70), Title = "Enemy" })
+	colorBox:AddLabel("Team"):AddColorPicker("TeamColor", { Default = Color3.fromRGB(80, 200, 255), Title = "Team" })
+	colorBox:AddLabel("Aimbot FOV"):AddColorPicker("FovColor", { Default = Color3.fromRGB(255, 255, 255), Title = "Aimbot FOV" })
+	colorBox:AddLabel("Silent FOV"):AddColorPicker("SilentFovColor", { Default = Color3.fromRGB(255, 200, 60), Title = "Silent FOV" })
+	colorBox:AddToggle("DrawAimbotFov", { Text = "Draw aimbot FOV", Default = true })
+	colorBox:AddToggle("DrawSilentFov", { Text = "Draw silent FOV", Default = true })
+
+	-- World and camera.
+	local worldBox = Tabs.Visuals:AddRightGroupbox("World")
+	worldBox:AddToggle("Fullbright", { Text = "Fullbright", Default = false })
+	worldBox:AddToggle("NoFog", { Text = "No fog", Default = false })
+	worldBox:AddToggle("FovChanger", { Text = "Camera FOV", Default = false })
+	worldBox:AddSlider("FovValue", { Text = "FOV value", Default = 90, Min = 40, Max = 120, Rounding = 0 })
+
+	-- Movement.
+	local moveBox = Tabs.Player:AddLeftGroupbox("Movement")
+	moveBox:AddToggle("SpeedBoost", { Text = "Speed boost", Default = false })
+	moveBox:AddSlider("SpeedValue", { Text = "Boost (studs/s)", Default = 10, Min = 1, Max = 60, Rounding = 0 })
+	moveBox:AddToggle("Noclip", { Text = "Noclip", Default = false })
+	moveBox:AddToggle("InfiniteJump", { Text = "Infinite jump", Default = false })
+
+	-- Misc.
+	local miscBox = Tabs.Player:AddRightGroupbox("Misc")
+	miscBox:AddToggle("AntiAfk", { Text = "Anti AFK", Default = true })
 
 	-- Settings.
-	local menuBox = tabs.settings:AddLeftGroupbox("Menu")
-	menuBox:AddButton({ Text = "Server hop", Func = serverHop })
-	menuBox:AddButton({ Text = "Unload", Func = function() Library:Unload() end })
+	local menuBox = Tabs.Settings:AddLeftGroupbox("Menu")
+	menuBox:AddButton("Unload", function()
+		Potent.detach()
+	end)
 	menuBox:AddLabel("Menu bind"):AddKeyPicker("MenuKeybind", { Default = "End", NoUI = true, Text = "Menu keybind" })
 	Library.ToggleKeybind = Options.MenuKeybind
 
@@ -966,87 +890,67 @@ function StreetLife.init()
 	SaveManager:SetLibrary(Library)
 	SaveManager:IgnoreThemeSettings()
 	SaveManager:SetIgnoreIndexes({ "MenuKeybind" })
-	ThemeManager:SetFolder("StreetLife")
-	SaveManager:SetFolder("StreetLife/StreetLifeRemastered")
-	SaveManager:BuildConfigSection(tabs.settings)
-	ThemeManager:ApplyToTab(tabs.settings)
+	ThemeManager:SetFolder(CONFIG_FOLDER)
+	SaveManager:SetFolder(CONFIG_FOLDER .. "/Tribes3v3")
+	SaveManager:BuildConfigSection(Tabs.Settings)
+	ThemeManager:ApplyToTab(Tabs.Settings)
+	SaveManager:LoadAutoloadConfig()
+end
 
-	-- Players for ESP.
-	for _, player in ipairs(playersService:GetPlayers()) do
-		createEsp(player)
-	end
+---Connect runtime hooks and loops.
+local function connectRuntime()
+	Potent.circles.aim = newDrawing("Circle", { Thickness = 1, NumSides = 64, Filled = false })
+	Potent.circles.silent = newDrawing("Circle", { Thickness = 1, NumSides = 64, Filled = false })
 
-	track(playersService.PlayerAdded:Connect(createEsp))
-	track(playersService.PlayerRemoving:Connect(removeEsp))
+	runService:BindToRenderStep(RENDER_STEP_NAME, Enum.RenderPriority.Camera.Value + 1, guarded("render", onRender))
+	table.insert(Potent.connections, runService.Heartbeat:Connect(guarded("heartbeat", onHeartbeat)))
+	table.insert(Potent.connections, runService.Stepped:Connect(guarded("stepped", onStepped)))
 
-	track(runService.RenderStepped:Connect(function()
-		local camera = workspace.CurrentCamera
-		updateFps()
-		updateCameraFov(camera)
-		updateAimbot(camera)
-		updateNoRecoil(camera)
-		updateEsp(camera)
+	table.insert(Potent.connections, playersService.PlayerRemoving:Connect(function(player)
+		destroyEsp(player)
+		Potent.velocities[player] = nil
 	end))
 
-	track(runService.Heartbeat:Connect(function()
-		local character, humanoid = getLocalParts()
-		if not humanoid then
-			return
-		end
-
-		updateMovement(humanoid)
-		updateGunMods(character, humanoid)
-	end))
-
-	track(runService.Stepped:Connect(function(_, deltaTime)
-		local character, humanoid = getLocalParts()
-		if not humanoid then
-			return
-		end
-
-		updateNoclip(character)
-		updateCar(humanoid, workspace.CurrentCamera, deltaTime)
-	end))
-
-	-- Infinite jump requires a fresh state change on every jump request.
-	track(userInputService.JumpRequest:Connect(function()
+	table.insert(Potent.connections, userInputService.JumpRequest:Connect(function()
 		if not Toggles.InfiniteJump.Value then
 			return
 		end
-
-		local _, humanoid = getLocalParts()
+		local character = localPlayer.Character
+		local humanoid = character and character:FindFirstChildOfClass("Humanoid")
 		if humanoid then
 			humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
 		end
 	end))
 
-	track(userInputService.InputBegan:Connect(function(input, processed)
-		if processed or input.UserInputType ~= Enum.UserInputType.MouseButton1 then
+	table.insert(Potent.connections, localPlayer.Idled:Connect(function()
+		if not Toggles.AntiAfk.Value then
 			return
 		end
-
-		StreetLife.shooting = true
-		StreetLife.lastPitch = nil
+		virtualUser:CaptureController()
+		virtualUser:ClickButton2(Vector2.zero)
 	end))
+end
 
-	track(userInputService.InputEnded:Connect(function(input)
-		if input.UserInputType ~= Enum.UserInputType.MouseButton1 then
-			return
-		end
+---Initialize the script.
+local function initializeScript()
+	Library = loadRemote("Library.lua")
+	local ThemeManager = loadRemote("addons/ThemeManager.lua")
+	local SaveManager = loadRemote("addons/SaveManager.lua")
 
-		StreetLife.shooting = false
-		StreetLife.lastPitch = nil
-	end))
+	Toggles = Library.Toggles or getgenv().Toggles
+	Options = Library.Options or getgenv().Options
+	assert(Toggles and Options, "Linoria did not expose Toggles/Options.")
 
-	-- The humanoid is replaced on respawn, so god mode needs to be re-applied.
-	track(localPlayer.CharacterAdded:Connect(function()
-		task.wait(1)
-		setupGodMode()
-	end))
+	setthreadidentity(2)
+	local success, weapons = pcall(require, replicatedStorage.Shared.Weapons)
+	setthreadidentity(8)
+	weaponsModule = success and weapons or nil
 
-	task.spawn(staminaLoop)
+	buildMenu(ThemeManager, SaveManager)
+	Library:OnUnload(Potent.detach)
+	connectRuntime()
 
-	Library:OnUnload(StreetLife.detach)
+	Library:Notify("Potent loaded.", 4)
 end
 
 ---This is called when initialization errors.
@@ -1055,15 +959,12 @@ local function onInitializeError(error)
 	warn("Failed to initialize.")
 	warn(error)
 	warn(debug.traceback())
-	StreetLife.detach()
+	Potent.detach()
 end
 
--- Detach the previous instance so re-execution starts clean.
-if shared.StreetLife then
-	shared.StreetLife.detach()
+if shared.Potent then
+	shared.Potent.detach()
 end
+shared.Potent = Potent
 
-shared.StreetLife = StreetLife
-xpcall(StreetLife.init, onInitializeError)
-
-return StreetLife
+xpcall(initializeScript, onInitializeError)
